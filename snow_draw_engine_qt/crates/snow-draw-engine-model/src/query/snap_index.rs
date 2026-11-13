@@ -4,8 +4,8 @@ use snow_draw_engine_core::{
     DrawRect, Point, SnapGuide, SnapGuideAxis, SnapGuideKind, SnapQuery, SnapResult,
 };
 use snow_draw_engine_document::{
-    Document, DocumentDelta, ElementData, ElementId, RectangleData, bracket_snap_points,
-    rect_bounds,
+    ArrowData, Document, DocumentDelta, ElementData, ElementId, RectangleData,
+    bracket_snap_points, rect_bounds,
 };
 
 use super::SpatialIndex;
@@ -14,6 +14,7 @@ use super::SpatialIndex;
 pub struct SnapIndex {
     rects: Vec<Option<DrawRect>>,
     brackets: BTreeMap<ElementId, BracketSnapReference>,
+    line_anchors: BTreeMap<ElementId, LineSnapReference>,
 }
 
 #[derive(Clone, Debug)]
@@ -22,16 +23,30 @@ struct BracketSnapReference {
     proxy: RectangleData,
 }
 
+/// Endpoint/vertex targets of a straight line or arrow. A line start cannot be
+/// aligned to a previous line's end through axis snapping alone, because the
+/// arrow contributes no bounding rectangle to `rects`; these anchors are tested
+/// by true 2D distance instead.
+#[derive(Clone, Debug)]
+struct LineSnapReference {
+    anchors: Vec<Point<f64>>,
+    proxy: RectangleData,
+}
+
 impl SnapIndex {
     pub fn rebuild(&mut self, document: &Document) {
         self.rects.clear();
         self.brackets.clear();
+        self.line_anchors.clear();
         for state in document.element_states() {
             if !state.visible {
                 continue;
             }
             if let Some(reference) = bracket_reference(state.data) {
                 self.brackets.insert(state.id, reference);
+            }
+            if let Some(reference) = line_reference(state.data) {
+                self.line_anchors.insert(state.id, reference);
             }
             let Some(rect) = snap_rectangle(state.data) else {
                 continue;
@@ -51,6 +66,7 @@ impl SnapIndex {
 
         for id in ids {
             self.brackets.remove(&id);
+            self.line_anchors.remove(&id);
             self.ensure_capacity(id.index as usize);
             self.rects[id.index as usize] = None;
             let Ok(element) = document.element(id) else {
@@ -61,6 +77,9 @@ impl SnapIndex {
             }
             if let Some(reference) = bracket_reference(&element.data) {
                 self.brackets.insert(id, reference);
+            }
+            if let Some(reference) = line_reference(&element.data) {
+                self.line_anchors.insert(id, reference);
             }
             let Some(rect) = snap_rectangle(&element.data) else {
                 continue;
@@ -90,6 +109,46 @@ impl SnapIndex {
         let mut best_y_distance = snap_y
             .map(|candidate| (candidate - query.point.y).abs())
             .unwrap_or(f64::INFINITY);
+
+        // Exact 2D snapping to line and arrow vertices. Axis alignment alone
+        // cannot land a new line's start on a previous line's end: arrows carry
+        // no bounding rectangle in `rects`, and aligning the two axes
+        // independently only converges when the cursor is already almost on the
+        // vertex. A nearest-vertex test within the threshold wins instead.
+        let mut point_snap: Option<(f64, Point<f64>)> = None;
+        for (id, reference) in &self.line_anchors {
+            if !include_candidate(*id, &reference.proxy) {
+                continue;
+            }
+            for anchor in &reference.anchors {
+                let dx = anchor.x - query.point.x;
+                let dy = anchor.y - query.point.y;
+                let distance = (dx * dx + dy * dy).sqrt();
+                if distance > query.threshold {
+                    continue;
+                }
+                let is_better = match point_snap {
+                    Some((best, _)) => distance < best,
+                    None => true,
+                };
+                if is_better {
+                    point_snap = Some((distance, *anchor));
+                }
+            }
+        }
+        if let Some((_, anchor)) = point_snap {
+            return SnapResult {
+                point: anchor,
+                guides: vec![SnapGuide {
+                    kind: SnapGuideKind::Point,
+                    axis: SnapGuideAxis::Vertical,
+                    start: anchor,
+                    end: anchor,
+                    markers: vec![anchor],
+                    label: None,
+                }],
+            };
+        }
 
         spatial_index.with_point_candidate_ids(query.point, query.threshold, |candidate_ids| {
             for id in candidate_ids {
@@ -219,35 +278,72 @@ fn bracket_reference(data: &ElementData) -> Option<BracketSnapReference> {
         return None;
     };
     let points = bracket_snap_points(arrow)?;
-    let bounds = DrawRect::new(
-        points.iter().map(|p| p.x).fold(f64::INFINITY, f64::min),
-        points.iter().map(|p| p.y).fold(f64::INFINITY, f64::min),
-        points.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max),
-        points.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max),
-    );
+    let bounds = point_bounds(&points)?;
     Some(BracketSnapReference {
         points,
         // Only the eligibility callback sees this proxy. Its edges and center
         // must never become alignment targets.
-        proxy: RectangleData {
-            text_element_id: None,
-            rectangle_kind: Default::default(),
-            highlight_shape: Default::default(),
-            center: bounds.center(),
-            width: bounds.width(),
-            height: bounds.height(),
-            rotation: 0.0,
-            fill: arrow.fill,
-            fill_style: arrow.fill_style,
-            stroke: arrow.stroke,
-            stroke_width: arrow.stroke_width,
-            stroke_style: arrow.stroke_style,
-            stroke_rendering_style: Default::default(),
-            stroke_rendering_seed: 0,
-            corner_radii: Default::default(),
-            opacity: arrow.opacity,
-        },
+        proxy: arrow_snap_proxy(arrow, bounds),
     })
+}
+
+fn line_reference(data: &ElementData) -> Option<LineSnapReference> {
+    let ElementData::Arrow(arrow) = data else {
+        return None;
+    };
+    // Brackets, distance and angle annotations carry computed geometry and are
+    // deliberately excluded; only plain lines and arrows act as targets.
+    if !(arrow.is_line() || arrow.is_regular_arrow()) || arrow.points.len() < 2 {
+        return None;
+    }
+    let anchors = arrow.global_points();
+    if anchors.len() < 2
+        || anchors
+            .iter()
+            .any(|point| !point.x.is_finite() || !point.y.is_finite())
+    {
+        return None;
+    }
+    let bounds = point_bounds(&anchors)?;
+    Some(LineSnapReference {
+        anchors,
+        // Only the eligibility callback sees this proxy. Its edges and center
+        // must never become alignment targets.
+        proxy: arrow_snap_proxy(arrow, bounds),
+    })
+}
+
+fn point_bounds(points: &[Point<f64>]) -> Option<DrawRect> {
+    let first = points.first()?;
+    let mut bounds = DrawRect::new(first.x, first.y, first.x, first.y);
+    for point in points {
+        bounds.min_x = bounds.min_x.min(point.x);
+        bounds.min_y = bounds.min_y.min(point.y);
+        bounds.max_x = bounds.max_x.max(point.x);
+        bounds.max_y = bounds.max_y.max(point.y);
+    }
+    Some(bounds)
+}
+
+fn arrow_snap_proxy(arrow: &ArrowData, bounds: DrawRect) -> RectangleData {
+    RectangleData {
+        text_element_id: None,
+        rectangle_kind: Default::default(),
+        highlight_shape: Default::default(),
+        center: bounds.center(),
+        width: bounds.width(),
+        height: bounds.height(),
+        rotation: 0.0,
+        fill: arrow.fill,
+        fill_style: arrow.fill_style,
+        stroke: arrow.stroke,
+        stroke_width: arrow.stroke_width,
+        stroke_style: arrow.stroke_style,
+        stroke_rendering_style: Default::default(),
+        stroke_rendering_seed: 0,
+        corner_radii: Default::default(),
+        opacity: arrow.opacity,
+    }
 }
 
 fn bracket_point_guide(axis: SnapGuideAxis, point: Point<f64>, reference: Point<f64>) -> SnapGuide {
@@ -296,3 +392,7 @@ fn nearest_grid_value(value: f64, include_grid: bool, grid_size: f64) -> Option<
 #[cfg(test)]
 #[path = "bracket_snap_tests.rs"]
 mod bracket_snap_tests;
+
+#[cfg(test)]
+#[path = "line_snap_tests.rs"]
+mod line_snap_tests;
